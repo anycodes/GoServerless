@@ -1,0 +1,88 @@
+Conf:
+  component: "serverless-global"
+  inputs:
+    region: ap-shanghai
+    bucket: go-serverless-1256773370
+    wxtoken:
+    appid:
+    secret:
+    secret_id:
+    secret_key:
+
+Weixin_Bucket:
+  component: '@serverless/tencent-cos'
+  inputs:
+    bucket: ${Conf.bucket}
+    region: ${Conf.region}
+
+Weixin_GoServerless:
+  component: "@serverless/tencent-scf"
+  inputs:
+    name: Weixin_GoServerless
+    codeUri: ./Admin
+    handler: index.main_handler
+    runtime: Python3.6
+    region: ap-shanghai
+    description: 微信公众号后台服务器配置
+    memorySize: 64
+    timeout: 100
+    environment:
+      variables:
+        region: ${Conf.region}
+        bucket: ${Conf.bucket}
+        wxtoken: ${Conf.wxtoken}
+        appid: ${Conf.appid}
+        secret: ${Conf.secret}
+        secret_id: ${Conf.secret_id}
+        secret_key: ${Conf.secret_key}
+    events:
+      - apigw:
+          name: Weixin_GoServerless
+          parameters:
+            serviceId: service-lu0iwy4t
+            protocols:
+              - https
+            environment: release
+            endpoints:
+              - path: /
+                serviceTimeout: 100
+                method: ANY
+                function:
+                  isIntegratedResponse: TRUE
+
+
+Weixin_GoServerless_GetIndexFile:
+  component: "@serverless/tencent-scf"
+  inputs:
+    name: Weixin_GoServerless_GetIndexFile
+    codeUri: ./GetIndexFile
+    handler: index.main_handler
+    runtime: Python3.6
+    region: ap-shanghai
+    description: 微信公众号索引建立功能
+    memorySize: 512
+    timeout: 100
+    environment:
+      variables:
+        region: ${Conf.region}
+        bucket: ${Conf.bucket}
+        secret_id: ${Conf.secret_id}
+        secret_key: ${Conf.secret_key}
+
+Weixin_GoServerless_SearchNews:
+  component: "@serverless/tencent-scf"
+  inputs:
+    name: Weixin_GoServerless_SearchNews
+    codeUri: ./SearchNews
+    handler: index.main_handler
+    runtime: Python3.6
+    region: ap-shanghai
+    description: 微信公众号图文搜索功能
+    memorySize: 384
+    timeout: 100
+    environment:
+      variables:
+        region: ${Conf.region}
+        bucket: ${Conf.bucket}
+        secret_id: ${Conf.secret_id}
+        secret_key: ${Conf.secret_key}
