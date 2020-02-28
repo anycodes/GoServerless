@@ -3,15 +3,21 @@ import os
 import re
 import json
 import time
+import random
+import base64
 import hashlib
 import xmltodict
 import urllib.parse
 import urllib.request
+from urllib3 import encode_multipart_formdata
 from qcloud_cos_v5 import CosConfig
 from qcloud_cos_v5 import CosS3Client
 from tencentcloud.common import credential
-from tencentcloud.scf.v20180416 import scf_client, models
+from tbp import tbp_client, models as tbp_models
+from tts import tts_client, models as tts_models
+from tencentcloud.scf.v20180416 import scf_client, models as scf_models
 
+bot_id = os.environ.get('bot_id')
 bucket = os.environ.get('bucket')
 secret_id = os.environ.get('secret_id')
 secret_key = os.environ.get('secret_key')
@@ -21,6 +27,8 @@ appid = os.environ.get('appid')
 secret = os.environ.get('secret')
 cosClient = CosS3Client(CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key))
 scfClient = scf_client.ScfClient(credential.Credential(secret_id, secret_key), region)
+tbpClient = tbp_client.TbpClient(credential.Credential(secret_id, secret_key), region)
+ttsClient = tts_client.TtsClient(credential.Credential(secret_id, secret_key), region)
 
 key = 'news/content.json'
 indexKey = 'news/content_index.json'
@@ -166,7 +174,7 @@ def saveNewsToCos():
             Key=key,
             EnableMD5=False
         )
-        req = models.InvokeRequest()
+        req = scf_models.InvokeRequest()
         params = '{"FunctionName":"Weixin_GoServerless_GetIndexFile", "ClientContext":"{\\"key\\": \\"%s\\", \\"index_key\\": \\"%s\\"}"}' % (
             key, indexKey)
         req.from_json_string(params)
@@ -343,7 +351,7 @@ def articlesXML(body, event):
 
 
 def searchNews(sentence):
-    req = models.InvokeRequest()
+    req = scf_models.InvokeRequest()
     params = '{"FunctionName":"Weixin_GoServerless_SearchNews", "ClientContext":"{\\"sentence\\": \\"%s\\", \\"key\\": \\"%s\\"}"}' % (
         sentence, indexKey)
     req.from_json_string(params)
@@ -383,6 +391,125 @@ def getNewsInfo(news):
     return articles
 
 
+def chatBot(user, content):
+    '''
+    开发文档：https://cloud.tencent.com/document/product/1060/37438
+    :param user: 用户id
+    :param content: 聊天内容
+    :return: 返回机器人说的话，如果出现故障返回None
+    '''
+    try:
+        req = tbp_models.TextProcessRequest()
+        params = '{"BotId":"%s","BotEnv":"release","TerminalId":"%s","InputText":"%s"}' % (
+            bot_id, user, content
+        )
+        req.from_json_string(params)
+        resp = tbpClient.TextProcess(req)
+        return json.loads(resp.to_json_string())['ResponseMessage']['GroupList'][0]['Content']
+    except Exception as e:
+        print(e)
+        return None
+
+
+def getNewsResult(media_id, event):
+    if media_id:
+        news = getNewsInfo(media_id)
+        if len(news) == 1:
+            return articlesXML({"articles": news}, event)
+        if len(news) > 1:
+            content = "\n".join(['<a href="%s">/:li %s</a>' % (eve["url"], eve["title"]) for eve in news])
+            return textXML({"msg": "为您搜索到以下相关内容：\n" + content}, event)
+    return None
+
+
+def text2Voice(text):
+    '''
+    文档地址：https://cloud.tencent.com/document/product/1073/37995
+    :param text: 带转换的文本
+    :return: 返回转换后的文件地址
+    '''
+    try:
+        req = tts_models.TextToVoiceRequest()
+        params = '{"Text":"%s","SessionId":"%s","ModelType":1,"VoiceType":1002}' % (
+            text, "".join(random.sample('zyxwvutsrqponmlkjihgfedcba', 7)))
+        req.from_json_string(params)
+        resp = ttsClient.TextToVoice(req)
+        file = '/tmp/' + "".join(random.sample('zyxwvutsrqponmlkjihgfedcba', 7)) + ".wav"
+        with open(file, 'wb') as f:
+            f.write(base64.b64decode(json.loads(resp.to_json_string())["Audio"]))
+        return file
+
+    except Exception as e:
+        print(e)
+        return None
+
+
+def addingOtherPermanentAssets(file, fileType):
+    '''
+    文档地址：https://developers.weixin.qq.com/doc/offiaccount/Asset_Management/Adding_Permanent_Assets.html
+    返回结果：{
+                "media_id":"HQOG98Gpaa4KcvU1L0MPEcyy31LSuHhRi8gD3pvebhI",
+                "url":"http:\/\/mmbiz.qpic.cn\/sz_mmbiz_png\/icxY5TTGTBibSyZPfLAEZmeaicUczsoGUpqLgBlRbNxeic4R8r94j60BiaxDLEZTAK7I7qubG3Ik808P8jYLdFJTcOA\/0?wx_fmt=png",
+                "item":[]
+            }
+    :param file:
+    :return:
+    '''
+    typeDict = {
+        "voice": "wav"
+    }
+    url = "https://api.weixin.qq.com/cgi-bin/material/add_material?access_token=%s&type=%s" % (
+        getAccessToken(), fileType)
+    boundary = '----WebKitFormBoundary7MA4YWxk%s' % "".join(random.sample('zyxwvutsrqponmlkjihgfedcba', 7))
+    with open(file, 'rb') as f:
+        fileData = f.read()
+    data = {'media': (os.path.split(file)[1], fileData, typeDict[fileType])}
+    headers = {
+        "Content-Type": "multipart/form-data; boundary=%s" % boundary,
+        "User-Agent": "okhttp/3.10.0"
+    }
+    reqAttr = urllib.request.Request(url=url,
+                                     data=encode_multipart_formdata(data, boundary=boundary)[0],
+                                     headers=headers)
+    responseData = json.loads(urllib.request.urlopen(reqAttr).read().decode("utf-8"))
+
+    try:
+        for eveVoice in getMaterialsList("voice", getTheTotalOfAllMaterials()['voice_count']):
+            try:
+                if int(time.time()) - int(eveVoice["update_time"]) > 60:
+                    deletingPermanentAssets(eveVoice['media_id'])
+            except:
+                pass
+    except:
+        pass
+
+    return responseData['media_id'] if "media_id" in responseData else None
+
+
+def getMaterial(media_id):
+    url = 'https://api.weixin.qq.com/cgi-bin/material/get_material?access_token=%s' % (getAccessToken())
+    data = {
+        "media_id": media_id
+    }
+    postData = json.dumps(data).encode("utf-8")
+    reqAttr = urllib.request.Request(url=url, data=postData)
+    print(urllib.request.urlopen(reqAttr).read())
+
+
+def deletingPermanentAssets(media_id):
+    '''
+    文档地址：https://developers.weixin.qq.com/doc/offiaccount/Asset_Management/Deleting_Permanent_Assets.html
+    :return:
+    '''
+    url = 'https://api.weixin.qq.com/cgi-bin/material/del_material?access_token=%s' % (getAccessToken())
+    data = {
+        "media_id": media_id
+    }
+    postData = json.dumps(data).encode("utf-8")
+    reqAttr = urllib.request.Request(url=url, data=postData)
+    print(urllib.request.urlopen(reqAttr).read())
+
+
 def main_handler(event, context):
     print('event: ', event)
 
@@ -418,20 +545,29 @@ def main_handler(event, context):
         if event["MsgType"] == "text":
             # 文本消息
             media_id = searchNews(event["Content"])
-            if media_id:
-                news = getNewsInfo(media_id)
-                if len(news) == 1:
-                    return response(body=articlesXML({"articles": news}, event))
-                if len(news) > 1:
-                    content = "\n".join(['<a href="%s">/:li %s</a>' % (eve["url"], eve["title"]) for eve in news])
-                    return response(body=textXML({"msg": "为您搜索到以下相关内容：\n" + content}, event))
-            return response(body=textXML({"msg": "目前还没有类似的文章被发布在这个公众号上"}, event))
+            result = getNewsResult(media_id, event)
+            if not result:
+                chatBotResponse = chatBot(event["FromUserName"], event["Content"])
+                result = textXML({"msg": chatBotResponse if chatBotResponse else "目前还没有类似的文章被发布在这个公众号上"}, event)
+            return response(body=result)
         elif event["MsgType"] == "image":
             # 图片消息
             return response(body=textXML({"msg": "这是一个图片消息"}, event))
         elif event["MsgType"] == "voice":
             # 语音消息
-            pass
+            media_id = searchNews(event["Recognition"])
+            result = getNewsResult(media_id, event)
+            if not result:
+                chatBotResponse = chatBot(event["FromUserName"], event["Recognition"])
+                if chatBotResponse:
+                    voiceFile = text2Voice(chatBotResponse)
+                    if voiceFile:
+                        uploadResult = addingOtherPermanentAssets(voiceFile, 'voice')
+                        if uploadResult:
+                            result = voiceXML({"media_id": uploadResult}, event)
+            if not result:
+                result = textXML({"msg": "目前还没有类似的文章被发布在这个公众号上"}, event)
+            return response(body=result)
         elif event["MsgType"] == "video":
             # 视频消息
             pass
@@ -452,8 +588,15 @@ def main_handler(event, context):
                     # 用户未关注时，进行关注后的事件推送（带参数的二维码）
                     pass
                 else:
-                    # 普通关注
-                    pass
+                    content = "😘 欢迎您关注GoServerless，让我们一起玩转Serverless吧！\n" \
+                              "😄 初来乍到，让我来介绍一下吧：\n" \
+                              "🔥 <a href='https://mp.weixin.qq.com/mp/homepage?__biz=Mzg2NzE4MDExNw==&hid=2&sn=168bd0620ee79cd35d0a80cddb9f2487'>精彩文章</a>\n" \
+                              "🔥 <a href='https://mp.weixin.qq.com/mp/homepage?__biz=Mzg2NzE4MDExNw==&hid=1&sn=69444401c5ed9746aeb1384fa6a9a201'>开源项目</a>\n" \
+                              "🔥 <a href='https://mp.weixin.qq.com/mp/homepage?__biz=Mzg2NzE4MDExNw==&hid=3&sn=a98b28c92399068cca596ae620c73374'>视频中心</a>\n" \
+                              "🔥 <a href='https://mp.weixin.qq.com/mp/profile_ext?action=home&__biz=Mzg2NzE4MDExNw==&scene=124#wechat_redirect'>历史文章</a>\n" \
+                              "🎃 如果你有问题可以直接提问，系统会自动给您搜索，例如您问：Serverless架构下如何上传图片？"
+
+                    return response(textXML({"msg": content}, event))
             elif event["Event"] == "unsubscribe":
                 # 取消订阅事件
                 pass
